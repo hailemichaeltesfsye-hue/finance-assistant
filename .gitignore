@@ -1,0 +1,8 @@
+.env
+accounts.db
+pii_registry.json
+__pycache__/
+*.pyc
+.venv/
+demo_out.log
+agent_token.txt

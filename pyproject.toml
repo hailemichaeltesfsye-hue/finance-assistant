@@ -1,0 +1,17 @@
+[project]
+name = "finance-assistant"
+version = "0.1.0"
+description = "MCP server for account balances, loans, and transactions"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=3.4.5",
+    "mcp[cli]",
+    "pydantic",
+    "pydantic-ai[groq]>=2.13.0",
+    "pytest>=9.1.1",
+    "python-certifi-win32>=1.6.1",
+    "rich>=15.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
