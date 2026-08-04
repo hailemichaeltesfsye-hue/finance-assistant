@@ -39,16 +39,17 @@ TOKEN_REGISTRY = {
 }
 
 
-def check_permission(required_scope: str, tool_name: str) -> dict | None:
+def check_permission(required_scope: str, tool_name: str, args: dict | None = None) -> dict | None:
     """
     Validates that the active client has the required scope to execute the tool.
-    Returns a denial dict instead of raising, so a permission denial is just
-    another normal tool result the model reads and reports — it never eats
-    pydantic-ai's tool-retry budget.
+    Every call — success or denial — is written to the audit log here, since this
+    is the one place every tool invocation is guaranteed to pass through.
     """
+    args = args or {}
     token = os.getenv("MCP_AUTH_TOKEN")
 
     if not token:
+        db.write_audit_log_db("Unknown (no token)", tool_name, args, "denied", "Missing MCP_AUTH_TOKEN")
         return {
             "status": "error",
             "error": "Access Denied",
@@ -56,6 +57,7 @@ def check_permission(required_scope: str, tool_name: str) -> dict | None:
         }
 
     if token not in TOKEN_REGISTRY:
+        db.write_audit_log_db("Unknown (invalid token)", tool_name, args, "denied", "Invalid MCP_AUTH_TOKEN")
         return {
             "status": "error",
             "error": "Access Denied",
@@ -64,26 +66,25 @@ def check_permission(required_scope: str, tool_name: str) -> dict | None:
 
     client_info = TOKEN_REGISTRY[token]
     allowed_scopes = client_info["scopes"]
+    role = client_info["role"]
 
     if required_scope not in allowed_scopes:
+        db.write_audit_log_db(role, tool_name, args, "denied", f"Missing required scope '{required_scope}'")
         return {
             "status": "error",
             "error": "Access Denied",
             "message": (
                 f"Insufficient privileges. Tool '{tool_name}' requires the '{required_scope}' scope. "
-                f"Your active role '{client_info['role']}' only possesses scopes: {sorted(allowed_scopes)}."
+                f"Your active role '{role}' only possesses scopes: {sorted(allowed_scopes)}."
             )
         }
 
+    db.write_audit_log_db(role, tool_name, args, "success", "Permission granted")
     return None
 # =========================================================================================
 
 
 # ===================== HUMAN-IN-THE-LOOP (HITL) SECURITY LAYER =====================
-# Enforced HERE, server-side — same reasoning as check_permission above. Any gated tool
-# called with an amount over this threshold gets logged as a pending_actions row instead
-# of executing immediately, and returns status: "pending_approval" + a pending_id.
-# Only approve_transaction/reject_transaction (admin:accounts / Manager only) can finalize it.
 HITL_THRESHOLD = 1000.0
 
 GATED_TOOL_EXECUTORS = {
@@ -100,6 +101,9 @@ def gate_if_over_threshold(tool_name: str, args: dict, amount: float) -> dict | 
     pending_approval payload if sign-off is required, or None to proceed normally."""
     if amount > HITL_THRESHOLD:
         pending_id = db.create_pending_action_db(tool_name, args, amount)
+        token = os.getenv("MCP_AUTH_TOKEN")
+        role = TOKEN_REGISTRY.get(token, {}).get("role", "Unknown")
+        db.write_audit_log_db(role, tool_name, args, "pending", f"Created pending_id {pending_id}")
         return {
             "status": "pending_approval",
             "pending_id": pending_id,
@@ -115,7 +119,7 @@ def gate_if_over_threshold(tool_name: str, args: dict, amount: float) -> dict | 
 @mcp.tool()
 def get_balance(account_id: int) -> dict:
     """Retrieves the balance of a specific account given its numeric account_id."""
-    denial = check_permission("read:accounts", "get_balance")
+    denial = check_permission("read:accounts", "get_balance", {"account_id": account_id})
     if denial:
         return denial
     return {"account_id": account_id, "balance": db.get_account_balance(account_id)}
@@ -124,7 +128,7 @@ def get_balance(account_id: int) -> dict:
 @mcp.tool()
 def search_transactions(query: str) -> list[dict] | dict:
     """Searches for transactions matching a query string."""
-    denial = check_permission("read:accounts", "search_transactions")
+    denial = check_permission("read:accounts", "search_transactions", {"query": query})
     if denial:
         return denial
     if not query.strip():
@@ -136,10 +140,10 @@ def search_transactions(query: str) -> list[dict] | dict:
 @mcp.tool()
 def deposit_funds(account_id: int, amount: float) -> dict:
     """Deposits funds into an account given its numeric account_id."""
-    denial = check_permission("write:transactions", "deposit_funds")
+    args = {"account_id": account_id, "amount": amount}
+    denial = check_permission("write:transactions", "deposit_funds", args)
     if denial:
         return denial
-    args = {"account_id": account_id, "amount": amount}
     pending = gate_if_over_threshold("deposit_funds", args, amount)
     if pending:
         return pending
@@ -151,10 +155,10 @@ def deposit_funds(account_id: int, amount: float) -> dict:
 @mcp.tool()
 def withdraw_funds(account_id: int, amount: float) -> dict:
     """Withdraws funds from an account given its numeric account_id."""
-    denial = check_permission("write:transactions", "withdraw_funds")
+    args = {"account_id": account_id, "amount": amount}
+    denial = check_permission("write:transactions", "withdraw_funds", args)
     if denial:
         return denial
-    args = {"account_id": account_id, "amount": amount}
     pending = gate_if_over_threshold("withdraw_funds", args, amount)
     if pending:
         return pending
@@ -166,10 +170,10 @@ def withdraw_funds(account_id: int, amount: float) -> dict:
 @mcp.tool()
 def transfer_funds(from_account_id: int, to_account_id: int, amount: float) -> dict:
     """Transfers funds from one account to another using numeric account IDs."""
-    denial = check_permission("write:transactions", "transfer_funds")
+    args = {"from_account_id": from_account_id, "to_account_id": to_account_id, "amount": amount}
+    denial = check_permission("write:transactions", "transfer_funds", args)
     if denial:
         return denial
-    args = {"from_account_id": from_account_id, "to_account_id": to_account_id, "amount": amount}
     pending = gate_if_over_threshold("transfer_funds", args, amount)
     if pending:
         return pending
@@ -181,10 +185,10 @@ def transfer_funds(from_account_id: int, to_account_id: int, amount: float) -> d
 @mcp.tool()
 def apply_for_loan(account_id: int, amount: float) -> dict:
     """Applies for a loan for the specified account ID."""
-    denial = check_permission("admin:loans", "apply_for_loan")
+    args = {"account_id": account_id, "amount": amount}
+    denial = check_permission("admin:loans", "apply_for_loan", args)
     if denial:
         return denial
-    args = {"account_id": account_id, "amount": amount}
     pending = gate_if_over_threshold("apply_for_loan", args, amount)
     if pending:
         return pending
@@ -196,10 +200,10 @@ def apply_for_loan(account_id: int, amount: float) -> dict:
 @mcp.tool()
 def pay_loan(loan_id: int, amount: float) -> dict:
     """Pays towards an active loan specified by loan_id."""
-    denial = check_permission("write:transactions", "pay_loan")
+    args = {"loan_id": loan_id, "amount": amount}
+    denial = check_permission("write:transactions", "pay_loan", args)
     if denial:
         return denial
-    args = {"loan_id": loan_id, "amount": amount}
     pending = gate_if_over_threshold("pay_loan", args, amount)
     if pending:
         return pending
@@ -214,7 +218,7 @@ def approve_transaction(pending_id: int) -> dict:
     Finalizes a pending action, executing the underlying deposit/withdraw/transfer/loan
     operation. Restricted to admin:accounts (Manager), regardless of who submitted it.
     """
-    denial = check_permission("admin:accounts", "approve_transaction")
+    denial = check_permission("admin:accounts", "approve_transaction", {"pending_id": pending_id})
     if denial:
         return denial
 
@@ -234,13 +238,15 @@ def approve_transaction(pending_id: int) -> dict:
 
     executor(pending["args"])
     db.resolve_pending_action_db(pending_id, "approved")
+    role = TOKEN_REGISTRY.get(os.getenv("MCP_AUTH_TOKEN"), {}).get("role", "Unknown")
+    db.write_audit_log_db(role, pending["tool_name"], pending["args"], "approved", f"Pending action {pending_id} approved and executed")
     return {"status": "success", "message": f"Pending action {pending_id} ({pending['tool_name']}) approved and executed."}
 
 
 @mcp.tool()
 def reject_transaction(pending_id: int) -> dict:
     """Rejects a pending action without executing it. Also restricted to admin:accounts."""
-    denial = check_permission("admin:accounts", "reject_transaction")
+    denial = check_permission("admin:accounts", "reject_transaction", {"pending_id": pending_id})
     if denial:
         return denial
 
@@ -255,13 +261,15 @@ def reject_transaction(pending_id: int) -> dict:
         }
 
     db.resolve_pending_action_db(pending_id, "rejected")
+    role = TOKEN_REGISTRY.get(os.getenv("MCP_AUTH_TOKEN"), {}).get("role", "Unknown")
+    db.write_audit_log_db(role, pending["tool_name"], pending["args"], "rejected", f"Pending action {pending_id} rejected")
     return {"status": "success", "message": f"Pending action {pending_id} rejected. No funds were moved."}
 
 
 @mcp.tool()
 def list_accounts(filter_status: str = "all") -> list[dict] | dict:
     """Lists accounts in the database, optionally filtered by status."""
-    denial = check_permission("admin:accounts", "list_accounts")
+    denial = check_permission("admin:accounts", "list_accounts", {"filter_status": filter_status})
     if denial:
         return denial
     accounts = db.list_accounts_db()
@@ -273,11 +281,29 @@ def list_accounts(filter_status: str = "all") -> list[dict] | dict:
 @mcp.tool()
 def search_accounts(query: str) -> list[dict] | dict:
     """Searches for accounts matching an owner name (e.g., 'Alice', 'Bob', 'Charlie') or role."""
-    denial = check_permission("read:accounts", "search_accounts")
+    denial = check_permission("read:accounts", "search_accounts", {"query": query})
     if denial:
         return denial
     accounts = db.search_accounts_db(query)
     return [a.model_dump() for a in accounts]
+
+
+@mcp.tool()
+def search_audit_log(query: str = "") -> list[dict] | dict:
+    """
+    Searches the security audit log — every permission check, granted or denied,
+    plus HITL pending/approved/rejected events. Manager credentials only.
+
+    Args:
+        query (str): Optional filter matched against role, tool_name, or outcome. Empty returns all entries.
+
+    Returns:
+        list[dict]: Audit entries, most recent first, or an error payload if access is denied.
+    """
+    denial = check_permission("admin:accounts", "search_audit_log", {"query": query})
+    if denial:
+        return denial
+    return db.search_audit_log_db(query if query else None)
 
 
 if __name__ == "__main__":

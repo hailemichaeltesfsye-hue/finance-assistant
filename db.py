@@ -63,6 +63,18 @@ def init_db():
             );
         """)
 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                role TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                args_json TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                detail TEXT NOT NULL
+            );
+        """)
+
         cursor.execute("SELECT COUNT(*) FROM accounts")
         if cursor.fetchone()[0] == 0:
             cursor.execute(
@@ -358,3 +370,44 @@ def resolve_pending_action_db(pending_id: int, new_status: str) -> None:
         cursor = conn.cursor()
         cursor.execute("UPDATE pending_actions SET status = ? WHERE id = ?", (new_status, pending_id))
         conn.commit()
+
+
+def write_audit_log_db(role: str, tool_name: str, args: dict, outcome: str, detail: str) -> None:
+    """Records one audit entry. Called for EVERY tool invocation attempt, success or not."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO audit_log (timestamp, role, tool_name, args_json, outcome, detail) VALUES (?, ?, ?, ?, ?, ?)",
+            (datetime.now().isoformat(), role, tool_name, json.dumps(args), outcome, detail)
+        )
+        conn.commit()
+
+
+def search_audit_log_db(query: str | None = None) -> list[dict]:
+    """Returns audit entries, optionally filtered by a query matched against role/tool_name/outcome."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        if query:
+            like_query = f"%{query}%"
+            cursor.execute(
+                """
+                SELECT id, timestamp, role, tool_name, args_json, outcome, detail
+                FROM audit_log
+                WHERE role LIKE ? OR tool_name LIKE ? OR outcome LIKE ?
+                ORDER BY id DESC
+                """,
+                (like_query, like_query, like_query)
+            )
+        else:
+            cursor.execute(
+                "SELECT id, timestamp, role, tool_name, args_json, outcome, detail FROM audit_log ORDER BY id DESC"
+            )
+        rows = cursor.fetchall()
+        return [
+            {
+                "id": row[0], "timestamp": row[1], "role": row[2],
+                "tool_name": row[3], "args": json.loads(row[4]),
+                "outcome": row[5], "detail": row[6],
+            }
+            for row in rows
+        ]

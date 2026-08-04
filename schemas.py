@@ -47,6 +47,15 @@ class WithdrawRequest(BaseModel):
     amount: float = Field(gt=0, description="Amount to withdraw, must be greater than 0")
 
 
+class AuditLogEntry(BaseModel):
+    id: int
+    timestamp: datetime
+    role: str
+    tool_name: str
+    args: dict
+    outcome: Literal["success", "denied", "pending", "approved", "rejected"]
+    detail: str
+
 class TransferRequest(BaseModel):
     from_account_id: int
     to_account_id: int
